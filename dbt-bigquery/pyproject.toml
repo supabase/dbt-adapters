@@ -35,8 +35,13 @@ dependencies = [
     "google-auth>=2.29.0",
     # add dbt-core to ensure backwards compatibility of installation, this is not a functional dependency
     "dbt-core>=1.11.6,<2.0",
-    "nbformat>=5.10.4",
-    "google-cloud-aiplatform>=1.148.0",
+    # supabase fork: `nbformat` and `google-cloud-aiplatform` are only needed for
+    # BigFrames Python models (lazy/TYPE_CHECKING-guarded imports, see clients.py /
+    # python_submissions.py). We don't use Python models, and google-cloud-aiplatform
+    # drags in a huge subtree that makes pip's resolver backtrack past Cloud Composer's
+    # package-install timeout. Dropped here so the wheel installs cleanly in Composer.
+    # "nbformat>=5.10.4",
+    # "google-cloud-aiplatform>=1.148.0",
 ]
 
 [project.urls]
