@@ -85,7 +85,7 @@ jobs:
               *)    envs='["staging"]' ;;
             esac
           else
-            envs='["staging"]'
+            envs='["staging", "prod"]'
           fi
 
           echo "version=${version}" >> "$GITHUB_OUTPUT"
