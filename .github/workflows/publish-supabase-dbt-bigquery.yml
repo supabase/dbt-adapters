@@ -58,12 +58,12 @@ jobs:
           EVENT_NAME: ${{ github.event_name }}
           TARGET: ${{ inputs.target }}
         run: |
-          # Publish under the exact upstream version from __version__.py (e.g. `1.11.0`),
-          # stripping any local suffix. Composer resolves this from our repo via the
-          # python-virtual index. Each push replaces the same version in place (see the
-          # delete-then-upload publish step), so the version is immutable-looking but
-          # always carries this fork's patch.
-          version="$(grep -E '^version' "$VERSION_FILE" | sed -E 's/.*"([^"]+)".*/\1/' | cut -d'+' -f1)"
+          # Publish as a next-patch pre-release (e.g. 1.11.1rc1): valid PEP 440 and dbt
+          # semver, and > the base image's bundled 1.11.0, so the pin forces the fork in.
+          # Bump the rc number here + in composer.ts to ship new fork code.
+          base="$(grep -E '^version' "$VERSION_FILE" | sed -E 's/.*"([^"]+)".*/\1/' | cut -d'+' -f1)"
+          mm="${base%.*}"; patch="${base##*.}"
+          version="${mm}.$((patch + 1))rc1"
 
           # Push publishes to both staging and prod. Dispatch selects the target(s).
           if [[ "$EVENT_NAME" == "workflow_dispatch" ]]; then
