@@ -1,0 +1,185 @@
+name: Publish Supabase dbt-bigquery fork (1.11.0-supabase)
+
+# Builds this fork's patched `dbt-bigquery` wheel + sdist and publishes them to
+# a private package registry, from which our internal platform installs the
+# package (a custom-repo index that takes priority over public PyPI). Registry
+# URLs and credentials come from repo variables, so no environment specifics
+# live in this file.
+#
+# Every push to the fork branch auto-publishes a fresh, timestamped version to
+# both STAGING and PROD. Use manual dispatch to target a single env (staging | prod).
+#
+# The only patch this fork carries is flexible BigQuery job reservation support
+# (upstream PR dbt-labs/dbt-adapters#1229, still open): it adds an optional
+# `reservation` credential that, when set, is passed through to the BigQuery job
+# params so a profile/target can route its queries to a specific slot
+# reservation.
+#
+# dbt-adapters is a monorepo (dbt-bigquery/dbt-snowflake/…), but this workflow
+# only builds the `dbt-bigquery` subpackage — the patch is entirely within
+# dbt-bigquery, which depends on a released `dbt-adapters` from public PyPI, so
+# the core package is not forked or republished here.
+
+on:
+  push:
+    branches:
+      - 1.11.0-supabase
+  workflow_dispatch:
+    inputs:
+      target:
+        description: "Publish target environment"
+        type: choice
+        options:
+          - staging
+          - prod
+          - both
+        default: staging
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  # Package subdirectory within the monorepo. All hatch/build steps run here.
+  PACKAGE_DIR: dbt-bigquery
+  VERSION_FILE: dbt-bigquery/src/dbt/adapters/bigquery/__version__.py
+
+jobs:
+  setup:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.resolve.outputs.version }}
+      envs: ${{ steps.resolve.outputs.envs }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - id: resolve
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          TARGET: ${{ inputs.target }}
+        run: |
+          # Publish under the exact upstream version from __version__.py (e.g. `1.11.0`),
+          # stripping any local suffix. Composer resolves this from our repo via the
+          # python-virtual index. Each push replaces the same version in place (see the
+          # delete-then-upload publish step), so the version is immutable-looking but
+          # always carries this fork's patch.
+          version="$(grep -E '^version' "$VERSION_FILE" | sed -E 's/.*"([^"]+)".*/\1/' | cut -d'+' -f1)"
+
+          # Push publishes to both staging and prod. Dispatch selects the target(s).
+          if [[ "$EVENT_NAME" == "workflow_dispatch" ]]; then
+            case "$TARGET" in
+              prod) envs='["prod"]' ;;
+              staging) envs='["staging"]' ;;
+              *)    envs='["staging","prod"]' ;;
+            esac
+          else
+            envs='["staging","prod"]'
+          fi
+
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
+          echo "envs=${envs}" >> "$GITHUB_OUTPUT"
+          echo "Resolved version: ${version}"
+          echo "Target envs: ${envs}"
+
+  publish:
+    needs: setup
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+
+    strategy:
+      fail-fast: false
+      matrix:
+        env: ${{ fromJSON(needs.setup.outputs.envs) }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.ref }}
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install hatch and twine
+        run: python -m pip install --upgrade hatch twine
+
+      - name: Resolve target env
+        id: target
+        env:
+          WIF_STAGING: ${{ vars.WIF_PROVIDER_STAGING }}
+          WIF_PROD: ${{ vars.WIF_PROVIDER_PROD }}
+          PUBLISHER_SA_STAGING: ${{ vars.PUBLISHER_SA_STAGING }}
+          PUBLISHER_SA_PROD: ${{ vars.PUBLISHER_SA_PROD }}
+          REPO_URL_STAGING: ${{ vars.AR_PYTHON_REPO_URL_STAGING }}
+          REPO_URL_PROD: ${{ vars.AR_PYTHON_REPO_URL_PROD }}
+        run: |
+          if [[ "${{ matrix.env }}" == "prod" ]]; then
+            echo "wif_provider=$WIF_PROD" >> "$GITHUB_OUTPUT"
+            echo "service_account=$PUBLISHER_SA_PROD" >> "$GITHUB_OUTPUT"
+            echo "repo_url=$REPO_URL_PROD" >> "$GITHUB_OUTPUT"
+          else
+            echo "wif_provider=$WIF_STAGING" >> "$GITHUB_OUTPUT"
+            echo "service_account=$PUBLISHER_SA_STAGING" >> "$GITHUB_OUTPUT"
+            echo "repo_url=$REPO_URL_STAGING" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ steps.target.outputs.wif_provider }}
+          service_account: ${{ steps.target.outputs.service_account }}
+
+      - name: Set up Cloud SDK
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: Stamp fork version
+        working-directory: ${{ env.PACKAGE_DIR }}
+        env:
+          VERSION: ${{ needs.setup.outputs.version }}
+        run: |
+          # Skip the set when already at VERSION — hatch rejects a non-increasing version.
+          current="$(hatch version 2>/dev/null | tail -1)"
+          if [ "$current" != "$VERSION" ]; then
+            hatch version "$VERSION"
+          fi
+          hatch version
+
+      - name: Build wheel and sdist
+        working-directory: ${{ env.PACKAGE_DIR }}
+        run: |
+          hatch build --clean
+          ls -l dist/
+          twine check dist/*
+
+      - name: Replace existing version in ${{ matrix.env }}
+        working-directory: ${{ env.PACKAGE_DIR }}
+        env:
+          VERSION: ${{ needs.setup.outputs.version }}
+          REPO_URL: ${{ steps.target.outputs.repo_url }}
+        run: |
+          # Fixed version, so delete the existing (immutable) version before reupload to
+          # avoid a 409; no-op on first run. Coordinates parsed from the repo URL
+          # (https://<location>-python.pkg.dev/<project>/<repo>/) to keep this file generic.
+          stripped="${REPO_URL#https://}"
+          host="${stripped%%/*}"; location="${host%-python.pkg.dev}"
+          rest="${stripped#*/}"; ar_project="${rest%%/*}"
+          rest="${rest#*/}"; ar_repo="${rest%%/*}"
+          gcloud artifacts versions delete "$VERSION" \
+            --package=dbt-bigquery --repository="$ar_repo" \
+            --location="$location" --project="$ar_project" --quiet \
+            || echo "No existing $VERSION to delete (first publish)."
+
+      - name: Publish to ${{ matrix.env }}
+        working-directory: ${{ env.PACKAGE_DIR }}
+        env:
+          # The registry accepts a short-lived OAuth2 access token via Basic auth.
+          TWINE_USERNAME: oauth2accesstoken
+          REPO_URL: ${{ steps.target.outputs.repo_url }}
+        run: |
+          TWINE_PASSWORD="$(gcloud auth print-access-token)" \
+            twine upload --repository-url "$REPO_URL" dist/*
+          echo "Published dbt-bigquery ${{ needs.setup.outputs.version }} to ${{ matrix.env }}"
